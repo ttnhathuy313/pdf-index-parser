@@ -4,6 +4,7 @@ import threading
 import fitz  # PyMuPDF
 from src.document import Document
 from ctypes import windll
+import asyncio
 windll.shcore.SetProcessDpiAwareness(1)
 
 class PDFIndexApp:
@@ -75,7 +76,7 @@ class PDFIndexApp:
             self.log("Index pages found: " + ", ".join(map(str, self.document.index_pages)))
             self.log("The page difference seems to be: " + str(self.document.page_difference))
             self.log("Parsing index pages...")
-            self.document.parse_index_pages()
+            asyncio.run(self.document.parse_index_pages())
             self.index_results = self.document.original_index
             self.update_results()
         except Exception as e:

@@ -1,26 +1,16 @@
 import fitz
 import re
 from utils.analyze_bboxes import is_two_vertical_blocks
+from src.llm_index_parse import llm_parse_index
+import json
+from collections import Counter
+import asyncio
 
 class Index:
     def __init__(self, term, occurrences_list):
         self.term = term
-        self.occurrences = self.parse_occurrences(occurrences_list)  # List of tuples (start, end)
-    
-    def parse_occurrences(self, occurrences_list):
-        occurrences = []
-        for occ in occurrences_list:
-            # Use regex to split by non-numeric characters
-            parts = re.split(r'\D+', occ)  # Split on any non-digit character
-            parts = list(filter(None, parts))  # Remove empty strings from the list
+        self.occurrences = occurrences_list  # List of tuples (start, end)
 
-            if len(parts) == 2:  # If we have a range (e.g., 44-45, 12~14, 98—107)
-                start, end = map(int, parts)
-                occurrences.append((start, end))
-            elif len(parts) == 1:  # Single page number
-                occurrences.append((int(parts[0]), int(parts[0])))
-
-        return occurrences
 
 class Document:
     def __init__(self, doc_type, path):
@@ -33,6 +23,7 @@ class Document:
         self.index_pages = []  # List of page numbers
         self.page_number_difference_list = []
         self.page_difference = 0
+        self.index_page_text = ""
 
     def add_index(self, term, occurrences):
         self.original_index.append(Index(term, occurrences))
@@ -49,65 +40,106 @@ class Document:
         with fitz.open(self.path) as pdf:
             for page_number, page in enumerate(pdf, start=1):
                 text = page.get_text("text")
-
                 # If the text starts with a number or ends with a number, it's likely the page number
                 if (re.match(r'^\d', text)):
                     current_internal_page_number = re.match(r'\d+', text).group(0)
                     self.page_number_difference_list.append(page_number - int(current_internal_page_number))
-                if (re.search(r'\d$', text)):
-                    self.page_number_difference_list.append(page_number - int(re.search(r'\d+$', text).group(0)))
+                match = re.search(r'\d+[\s|\n]*$', text)
+                if match:
+                    self.page_number_difference_list.append(page_number - int(match.group(0)))
                 
                 # An index page should have at least 10 numbers
                 # Find the number of matches using a regular expression \d+
                 match_count = len(re.findall(r"\d+", text))
                 if match_count <= 10:
                     continue
-                if (not is_two_vertical_blocks(page)):
+                # Simple regex to match index entries
+                pattern = r"^[^,]+,\s*\d+"
+                matches = re.findall(pattern, text, re.MULTILINE)
+                if (len(matches) < 10):
                     continue
                 self.add_index_page(page_number)
-        # Use median to get the page difference
-        self.page_difference = sorted(self.page_number_difference_list)[len(self.page_number_difference_list) // 2]
-    
-    def parse_index_pages(self):
+        if self.page_number_difference_list:
+            self.page_difference = Counter(self.page_number_difference_list).most_common(1)[0][0]
+        # Only keep the longest consecutive sequence of index pages
+        if self.index_pages:
+            longest_sequence = [self.index_pages[0]]
+            current_sequence = [self.index_pages[0]]
+            for i in range(1, len(self.index_pages)):
+                if self.index_pages[i] == self.index_pages[i - 1] + 1:
+                    current_sequence.append(self.index_pages[i])
+                else:
+                    if len(current_sequence) > len(longest_sequence):
+                        longest_sequence = current_sequence
+                    current_sequence = [self.index_pages[i]]
+            if len(current_sequence) > len(longest_sequence):
+                longest_sequence = current_sequence
+            self.index_pages = longest_sequence
+        else:
+            print("No index pages found.")
+
+    async def extract_page_text(self, pdf, page_number):
+        page = pdf.load_page(page_number - 1)
+        return page.get_text("text", flags=fitz.TEXT_INHIBIT_SPACES)
+
+    async def parse_index_pages(self):
+        self.index_page_text = ""
         with fitz.open(self.path) as pdf:
-            for page_number in self.index_pages:
-                page = pdf[page_number - 1]
-                text = page.get_text("text")
-                self.parse_index(text)
+            tasks = [self.extract_page_text(pdf, page_number) for page_number in self.index_pages]
+
+            # Run all tasks concurrently
+            extracted_texts = await asyncio.gather(*tasks)
+            self.index_page_text = "".join(extracted_texts)
+
+        # Call the asynchronous parse_index method
+        await self.parse_index(self.index_page_text)
+
+    async def parse_index(self, text):
+        chunks = list(self.split_text_into_chunks(text))
+        print("Number of chunks:", len(chunks))
+        tasks = [self.process_chunk(chunk) for chunk in chunks]
+        results = await asyncio.gather(*tasks)
+        
+        # Process results in order
+        for result in results:
+            for entry in result:
+                self.add_index(entry.term, entry.occurrences)
     
-    def parse_index(self, text):
-        # Step 1: Preprocess text to handle multi-line entries
-        # Merge lines if the next line starts with a number or hyphen (continuing occurrences)
-        lines = text.split('\n')
-        merged_lines = []
-        buffer = ""
+    def split_text_into_chunks(self, text, lines_per_chunk=100):
+        lines = text.splitlines()
+        for i in range(0, len(lines), lines_per_chunk):
+            yield "\n".join(lines[i:i + lines_per_chunk])
 
-        for line in lines:
-            line = line.strip()
-            if not line:  # Skip empty lines
-                continue
-            if re.match(r'^\d', line) or re.match(r'^\s*\d', line):  # Line starts with a number (continuation)
-                buffer += " " + line  # Append to the previous buffer
-            else:
-                if buffer:  # Save the previous buffer if it exists
-                    merged_lines.append(buffer)
-                buffer = line  # Start a new entry
-        if buffer:  # Add the last buffer
-            merged_lines.append(buffer)
-        # Step 2: Extract terms and their occurrences
-        entries = []
-        pattern = r'^(.*?),\s([\d,\-\s—~]+(?:,\s?\d+)?)$'
+    async def process_chunk(self, text):
+        index = await llm_parse_index(text)
+        results = []
+        if index.startswith("```json"):
+            index = index[len("```json"):].strip()
+        if index.endswith("```"):
+            index = index[:-len("```")].strip()
+        try:
+            parsed_index = json.loads(index)
+            for entry in parsed_index:
+                term = entry["t"]
+                occurrences = entry["o"]
+                occurrences_list = []
+                for occurrence in occurrences:
+                    try:
+                        start = occurrence["s"]
+                        end = occurrence["e"]
+                        occurrences_list.append((start, end))
+                    except KeyError:
+                        print("Missing 'start' or 'end' key in occurrence")
+                results.append(Index(term, occurrences_list))
+        except json.JSONDecodeError as e:
+            print(f"JSONDecodeError: {e}")
 
-        for line in merged_lines:
-            match = re.match(pattern, line)
-            if match:
-                term = match.group(1).strip()  # Capture the term
-                occurrences = match.group(2).strip()  # Capture the occurrences
-                # Convert occurrences into a list, splitting by commas and spaces
-                occurrences_list = [occ.strip() for occ in re.split(r',\s*', occurrences)]
-                entries.append((term, occurrences_list))
-                self.add_index(term, occurrences_list)
+        return results
 
-        return entries
-
+if __name__ == "__main__":
+    doc = Document("pdf", "./resource/pdf/irrational.pdf")
+    doc.filter_index_pages()
+    doc.parse_index_pages()
+    # for index in doc.original_index:
+    #     print(f"{index.term}: {index.occurrences}")
 
