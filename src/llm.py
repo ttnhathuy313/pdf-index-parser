@@ -47,5 +47,7 @@ async def llm_call(text):
 
 # Example usage
 if __name__ == "__main__":
-    result = llm_call("Explain how AI works")
+    import asyncio
+
+    result = asyncio.run(llm_call("Explain how AI works"))
     print(result)
