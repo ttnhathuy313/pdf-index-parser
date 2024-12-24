@@ -1,3 +1,3 @@
-fitz==0.0.1.dev2
+PyMuPDF
 python-dotenv
 aiohttp
