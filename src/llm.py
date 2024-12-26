@@ -43,11 +43,15 @@ async def llm_call(text):
     async with aiohttp.ClientSession() as session:
         async with session.post(url, headers=headers, json=data) as response:
             response_data = await response.json()
-            return response_data['candidates'][0]['content']['parts'][0]['text']
+            try:
+                return_data = response_data['candidates'][0]['content']['parts'][0]['text']
+            except Exception as e:
+                print(e)
+                return None
+            return return_data
 
 # Example usage
 if __name__ == "__main__":
     import asyncio
 
     result = asyncio.run(llm_call("Explain how AI works"))
-    print(result)

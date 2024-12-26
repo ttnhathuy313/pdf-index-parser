@@ -5,6 +5,21 @@ from src.llm_index_parse import llm_parse_index
 import json
 from collections import Counter
 import asyncio
+import time
+import json_repair
+
+# TODO: Put this in the utils file
+class RateLimiter:
+    def __init__(self, max_calls, period):
+        self.max_calls = max_calls
+        self.period = period
+        self.calls = []
+    
+    async def acquire(self):
+        while len(self.calls) >= self.max_calls:
+            await asyncio.sleep(self.period - (time.time() - self.calls[0]))
+            self.calls = [call for call in self.calls if time.time() - call < self.period]
+        self.calls.append(time.time())
 
 class Index:
     def __init__(self, term, occurrences_list):
@@ -56,6 +71,9 @@ class Document:
                 # Simple regex to match index entries
                 pattern = r"^[^,]+,\s*\d+"
                 matches = re.findall(pattern, text, re.MULTILINE)
+                if ("index" in text[:100].lower()):
+                    self.add_index_page(page_number)
+                    continue
                 if (len(matches) < 10):
                     continue
                 self.add_index_page(page_number)
@@ -74,13 +92,25 @@ class Document:
                     current_sequence = [self.index_pages[i]]
             if len(current_sequence) > len(longest_sequence):
                 longest_sequence = current_sequence
+            with fitz.open(self.path) as pdf:
+                # The begin of the index sequence should contain the word
+                # "index" in the first 10 lines
+                while (True):
+                    if (len(longest_sequence) == 0):
+                        break
+                    page = pdf.load_page(longest_sequence[0] - 1)
+                    text = page.get_text("text")[:100]
+                    if "index" in text.lower():
+                        break
+                    longest_sequence = longest_sequence[1:]
             self.index_pages = longest_sequence
+
         else:
             print("No index pages found.")
 
     async def extract_page_text(self, pdf, page_number):
         page = pdf.load_page(page_number - 1)
-        return page.get_text("text", flags=fitz.TEXT_INHIBIT_SPACES)
+        return page.get_text("text")
 
     async def parse_index_pages(self):
         self.index_page_text = ""
@@ -97,7 +127,16 @@ class Document:
     async def parse_index(self, text):
         chunks = list(self.split_text_into_chunks(text))
         print("Number of chunks:", len(chunks))
-        tasks = [self.process_chunk(chunk) for chunk in chunks]
+        
+        semaphore = asyncio.Semaphore(10)  # Limit to 10 concurrent tasks
+        rate_limiter = RateLimiter(15, 60)
+
+        async def sem_process_chunk(chunk):
+            async with semaphore:
+                await rate_limiter.acquire()
+                return await self.process_chunk(chunk)
+
+        tasks = [sem_process_chunk(chunk) for chunk in chunks]
         results = await asyncio.gather(*tasks)
         
         # Process results in order
@@ -105,7 +144,7 @@ class Document:
             for entry in result:
                 self.add_index(entry.term, entry.occurrences)
     
-    def split_text_into_chunks(self, text, lines_per_chunk=100):
+    def split_text_into_chunks(self, text, lines_per_chunk=120):
         lines = text.splitlines()
         for i in range(0, len(lines), lines_per_chunk):
             yield "\n".join(lines[i:i + lines_per_chunk])
@@ -118,20 +157,25 @@ class Document:
         if index.endswith("```"):
             index = index[:-len("```")].strip()
         try:
-            parsed_index = json.loads(index)
+            parsed_index = json_repair.loads(index)
             for entry in parsed_index:
                 term = entry["t"]
                 occurrences = entry["o"]
                 occurrences_list = []
                 for occurrence in occurrences:
                     try:
-                        start = occurrence["s"]
-                        end = occurrence["e"]
+                        if (len(occurrence) == 1):
+                            start = occurrence[0]
+                            end = occurrence[0]
+                        else:
+                            start = occurrence[0]
+                            end = occurrence[1]
                         occurrences_list.append((start, end))
-                    except KeyError:
-                        print("Missing 'start' or 'end' key in occurrence")
+                    except Exception as e:
+                        print(f"Error parsing occurrence: {e}, occurrence: {occurrence}")
                 results.append(Index(term, occurrences_list))
         except json.JSONDecodeError as e:
+            print(index)
             print(f"JSONDecodeError: {e}")
 
         return results

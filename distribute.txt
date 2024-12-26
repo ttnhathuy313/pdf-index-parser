@@ -1,0 +1,1 @@
+pyinstaller --noconfirm --onedir --windowed --log-level "DEBUG" --debug "all" --paths "C:\Users\Lenovo\AppData\Local\Programs\Python\Python312\Lib\site-packages" --paths "C:\Huy\Work\pdf-ocr"  "C:\Huy\Work\pdf-ocr\main.py"

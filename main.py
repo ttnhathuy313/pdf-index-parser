@@ -5,6 +5,7 @@ import fitz  # PyMuPDF
 from src.document import Document
 from ctypes import windll
 import asyncio
+import traceback
 windll.shcore.SetProcessDpiAwareness(1)
 
 class PDFIndexApp:
@@ -81,6 +82,7 @@ class PDFIndexApp:
             self.update_results()
         except Exception as e:
             self.log(f"Error: {e}")
+            self.log(f"Traceback: {traceback.format_exc()}")
         finally:
             self.progress.stop()
             self.log("Processing complete.")
